@@ -1,6 +1,6 @@
 .PHONY: run frontend check ruff database lint api start-all stop-all status clean-cache worker worker-start worker-stop worker-restart
 .PHONY: docker-buildx-prepare docker-buildx-clean docker-buildx-reset
-.PHONY: docker-push docker-push-latest docker-release docker-build-local tag export-docs
+.PHONY: docker-push docker-push-latest docker-release docker-build-local tag export-docs disal-release
 
 # Get version from pyproject.toml
 VERSION := $(shell grep -m1 version pyproject.toml | cut -d'"' -f2)
@@ -8,6 +8,9 @@ VERSION := $(shell grep -m1 version pyproject.toml | cut -d'"' -f2)
 # Image names for both registries
 DOCKERHUB_IMAGE := lfnovo/open_notebook
 GHCR_IMAGE := ghcr.io/lfnovo/open-notebook
+
+# Disal production image (server pulls this tag on every deploy)
+DISAL_IMAGE := juanemar/disal_notebook
 
 # Build platforms
 PLATFORMS := linux/amd64,linux/arm64
@@ -126,8 +129,22 @@ tag:
 	git push origin "v$$version"
 
 
+# Build and push the Disal production image to Docker Hub.
+# Run this after every change that needs to be deployed to the Disal server.
+# The server pulls juanemar/disal_notebook:latest on each deploy.
+disal-release:
+	@echo "🔨 Building Disal production image (basePath=/notebook)..."
+	MSYS_NO_PATHCONV=1 docker build \
+		--build-arg NEXT_PUBLIC_BASE_PATH=/notebook \
+		-t $(DISAL_IMAGE):latest \
+		.
+	@echo "📤 Pushing $(DISAL_IMAGE):latest to Docker Hub..."
+	docker push $(DISAL_IMAGE):latest
+	@echo "✅ Done. Deploy on the server with:"
+	@echo "   docker compose pull open_notebook && docker compose up -d --no-deps open_notebook"
+
 dev:
-	docker compose -f docker-compose.dev.yml up --build 
+	docker compose -f docker-compose.dev.yml up --build
 
 full:
 	docker compose -f docker-compose.full.yml up --build 

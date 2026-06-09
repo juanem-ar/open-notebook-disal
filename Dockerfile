@@ -8,7 +8,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # Add Node.js 20.x LTS for building frontend
 # NOTE: gcc/g++/make removed - uv should download pre-built wheels. Add back if build fails.
 # NOTE: gcc/g++/make required for some python dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true && \
+    apt-get update && apt-get install -y --no-install-recommends \
     curl \
     build-essential \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -53,12 +54,22 @@ RUN npm config set registry ${NPM_REGISTRY} \
  && npm config set fetch-retry-maxtimeout 120000
 # Retry npm ci to survive transient registry ECONNRESETs, which are common on
 # the QEMU-emulated arm64 leg of the multi-arch build.
-RUN i=0; until npm ci; do \
+# Increment NPM_CI_CACHE_BUST to force a clean npm ci (e.g. --build-arg NPM_CI_CACHE_BUST=2)
+ARG NPM_CI_CACHE_BUST=1
+RUN echo "npm ci cache bust: ${NPM_CI_CACHE_BUST}" && \
+    i=0; until npm ci; do \
       i=$((i+1)); \
       if [ "$i" -ge 5 ]; then echo "npm ci failed after $i attempts"; exit 1; fi; \
       echo "npm ci failed (attempt $i); retrying in 15s"; sleep 15; \
     done
-COPY frontend/ ./
+# NOTE: No COPY frontend/ here — source files are already in /app/frontend/ from
+# "COPY . /app" above. A second COPY would create an opaque overlay layer that
+# hides node_modules installed by npm ci above.
+# Accept subpath base at build time (e.g. --build-arg NEXT_PUBLIC_BASE_PATH=/notebook).
+# Leave empty for root deployment (default). Must be set before npm run build
+# because Next.js bakes basePath into the static bundle at compile time.
+ARG NEXT_PUBLIC_BASE_PATH=
+ENV NEXT_PUBLIC_BASE_PATH=${NEXT_PUBLIC_BASE_PATH}
 RUN npm run build
 
 # Return to app root
@@ -69,7 +80,8 @@ FROM python:3.12-slim-bookworm AS runtime
 
 # Install only runtime system dependencies (no build tools)
 # Add Node.js 20.x LTS for running frontend
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true && \
+    apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ffmpeg \
     supervisor \
     curl \

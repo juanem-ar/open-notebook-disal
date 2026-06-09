@@ -1,4 +1,5 @@
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TypeVar, Union
@@ -7,6 +8,30 @@ from loguru import logger
 from surrealdb import AsyncSurreal, RecordID  # type: ignore
 
 T = TypeVar("T", Dict[str, Any], List[Dict[str, Any]])
+
+
+def _escape_record_id(record_id: Union[str, "RecordID"]) -> str:
+    """Return a SurrealQL-safe representation of *record_id*.
+
+    SurrealDB bare identifiers only allow ``[a-zA-Z0-9_]``.  Any other
+    character in the ID part (e.g. hyphens from Teams/Slack conversation IDs)
+    must be wrapped in backticks, e.g. ``chat_session:`teams-conv-123```.
+
+    The SurrealDB Python driver's str(RecordID) returns ``table:⟨id⟩`` for
+    string IDs that contain special characters.  We unwrap that notation before
+    backtick-escaping so we always reference the *original* record and never
+    create a second record whose ID is literally ``⟨original-id⟩``.
+    """
+    str_id = str(record_id)
+    if ":" in str_id:
+        table, _, id_part = str_id.partition(":")
+        # Unwrap SurrealDB ⟨…⟩ driver notation to get the raw ID string
+        if id_part.startswith("⟨") and id_part.endswith("⟩"):
+            id_part = id_part[1:-1]
+        if not re.match(r"^[a-zA-Z0-9_]+$", id_part):
+            return f"{table}:`{id_part}`"
+        return f"{table}:{id_part}"
+    return str_id
 
 
 def get_database_url():
@@ -127,7 +152,8 @@ async def repo_upsert(
     data.pop("id", None)
     if add_timestamp:
         data["updated"] = datetime.now(timezone.utc)
-    query = f"UPSERT {id if id else table} MERGE $data;"
+    target = id if id else table
+    query = f"UPSERT {_escape_record_id(target) if id else table} MERGE $data;"
     return await repo_query(query, {"data": data})
 
 
@@ -145,7 +171,7 @@ async def repo_update(
         if "created" in data and isinstance(data["created"], str):
             data["created"] = datetime.fromisoformat(data["created"])
         data["updated"] = datetime.now(timezone.utc)
-        query = f"UPDATE {record_id} MERGE $data;"
+        query = f"UPSERT {_escape_record_id(record_id)} MERGE $data;"
         # logger.debug(f"Update query: {query}")
         result = await repo_query(query, {"data": data})
         # if isinstance(result, list):

@@ -8,6 +8,9 @@ import {
   NotebookChatMessage,
   BuildContextRequest,
   BuildContextResponse,
+  MultiNotebookChatSession,
+  CreateMultiNotebookChatSessionRequest,
+  MultiExecuteChatRequest,
 } from '@/lib/types/api'
 
 export const chatApi = {
@@ -64,6 +67,28 @@ export const chatApi = {
       `/chat/context`,
       data
     )
+    return response.data
+  },
+
+  // Multi-notebook chat
+  createMultiSession: async (data: CreateMultiNotebookChatSessionRequest) => {
+    const response = await apiClient.post<MultiNotebookChatSession>(
+      `/chat/sessions`,
+      {
+        notebook_id: data.notebook_ids[0] ?? null,
+        notebook_ids: data.notebook_ids,
+        title: data.title,
+        model_override: data.model_override,
+      }
+    )
+    return response.data
+  },
+
+  executeMulti: async (data: MultiExecuteChatRequest) => {
+    const response = await apiClient.post<{
+      session_id: string
+      messages: NotebookChatMessage[]
+    }>(`/chat/multi/execute`, data)
     return response.data
   },
 }

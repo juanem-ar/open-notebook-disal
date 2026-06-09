@@ -5,7 +5,7 @@ import { NotebookResponse } from '@/lib/types/api'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { MoreHorizontal, Archive, ArchiveRestore, Trash2, FileText, StickyNote } from 'lucide-react'
+import { MoreHorizontal, Archive, ArchiveRestore, Trash2, FileText, StickyNote, Copy, Check } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import {
   DropdownMenu,
@@ -25,8 +25,16 @@ interface NotebookCardProps {
 export function NotebookCard({ notebook }: NotebookCardProps) {
   const { t, language } = useTranslation()
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [copied, setCopied] = useState(false)
   const router = useRouter()
   const updateNotebook = useUpdateNotebook()
+
+  const handleCopyId = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    navigator.clipboard.writeText(notebook.id)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
 
   const handleArchiveToggle = (e: React.MouseEvent) => {
     e.stopPropagation()
@@ -122,6 +130,22 @@ export function NotebookCard({ notebook }: NotebookCardProps) {
                 <StickyNote className="h-3 w-3" />
                 <span>{notebook.note_count}</span>
               </Badge>
+            </div>
+
+            {/* Notebook ID */}
+            <div className="mt-2 flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+              <span className="font-mono text-[10px] text-muted-foreground truncate flex-1">
+                {notebook.id}
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-5 w-5 p-0 shrink-0 text-muted-foreground hover:text-foreground"
+                onClick={handleCopyId}
+                title="Copiar ID"
+              >
+                {copied ? <Check className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
+              </Button>
             </div>
           </CardContent>
       </Card>

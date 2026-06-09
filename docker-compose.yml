@@ -13,7 +13,8 @@ services:
     pull_policy: always
 
   open_notebook:
-    image: lfnovo/open_notebook:v1-latest
+    image: open_notebook:local
+    pull_policy: never
     ports:
       - "8502:8502"  # Web UI
       - "5055:5055"  # REST API
@@ -33,4 +34,16 @@ services:
     depends_on:
       - surrealdb
     restart: always
-    pull_policy: always
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:5678/
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+    restart: always

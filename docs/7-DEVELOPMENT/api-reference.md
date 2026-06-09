@@ -6,6 +6,8 @@ Complete REST API for Open Notebook. All endpoints are served from the API backe
 
 **Interactive Docs**: Use FastAPI's built-in Swagger UI at `http://localhost:5055/docs` for live testing and exploration. This is the primary reference for all endpoints, request/response schemas, and real-time testing.
 
+**External integrations (n8n, scripts, pipelines)**: See [Sources External Integration Guide](sources-external-integration.md) for curl examples covering listing, creating, replacing, and polling sources from outside Open Notebook.
+
 ---
 
 ## Quick Start

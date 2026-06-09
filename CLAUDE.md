@@ -207,6 +207,32 @@ See dedicated CLAUDE.md files for detailed guidance:
 4. Deploy `docker compose --profile multi up`
 5. Verify migrations via API logs
 
+### Disal Production Deployment
+
+La imagen productiva de Disal se publica en Docker Hub como **`juanemar/disal_notebook:latest`**.
+El servidor de producción hace `pull` de esa imagen al arrancar con `docker-compose.yml`.
+
+**Cada vez que se realizan cambios hay que compilar y publicar la imagen:**
+
+Con `make` disponible (Linux/Mac/WSL):
+```bash
+make disal-release
+```
+
+Sin `make` (Windows / Git Bash):
+```bash
+docker build -t juanemar/disal_notebook:latest .
+docker push juanemar/disal_notebook:latest
+```
+
+Luego en el servidor de producción:
+```bash
+docker compose pull open_notebook
+docker compose up -d --no-deps open_notebook
+```
+
+> El target `disal-release` del `Makefile` encapsula el build + push en un solo comando.
+
 ---
 
 ## Support & Community

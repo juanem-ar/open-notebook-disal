@@ -239,3 +239,32 @@ export interface BuildContextResponse {
   token_count: number
   char_count: number
 }
+
+// Multi-notebook chat types
+export interface MultiNotebookChatSession extends BaseChatSession {
+  notebook_ids: string[]
+}
+
+export interface CreateMultiNotebookChatSessionRequest {
+  notebook_ids: string[]
+  title?: string
+  model_override?: string
+}
+
+export interface MultiExecuteChatRequest {
+  session_id: string
+  message: string
+  model_override?: string
+}
+
+export interface AskRequest {
+  session_id: string
+  message: string
+  notebook_ids?: string[]
+  model_override?: string
+}
+
+export interface AskResponse {
+  session_id: string
+  reply: string
+}

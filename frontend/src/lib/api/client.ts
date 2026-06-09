@@ -56,7 +56,8 @@ apiClient.interceptors.response.use(
       // Clear auth and redirect to login
       if (typeof window !== 'undefined') {
         localStorage.removeItem('auth-storage')
-        window.location.href = '/login'
+        const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ''
+        window.location.href = `${basePath}/login`
       }
     }
     return Promise.reject(error)

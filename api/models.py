@@ -330,6 +330,34 @@ class SourceUpdate(BaseModel):
     topics: Optional[List[str]] = Field(None, description="Source topics")
 
 
+class SourceContentUpdate(BaseModel):
+    """Request schema for replacing the full content of an existing source.
+
+    Unlike SourceUpdate (which only touches metadata), this replaces the
+    underlying asset (file / URL / text), re-extracts the text and
+    re-generates embeddings — while keeping the same source ID so every
+    notebook that references it sees the new content automatically.
+    """
+
+    type: str = Field(..., description="Source type: link, upload, or text")
+    url: Optional[str] = Field(None, description="URL for link type")
+    file_path: Optional[str] = Field(
+        None, description="Server-side file path for upload type (alternative to multipart upload)"
+    )
+    content: Optional[str] = Field(None, description="Text content for text type")
+    title: Optional[str] = Field(None, description="Optional new title (keeps existing title if omitted)")
+    transformations: Optional[List[str]] = Field(
+        default_factory=list, description="Transformation IDs to apply after processing"
+    )
+    embed: bool = Field(True, description="Re-embed content for vector search (default: True)")
+    delete_source: bool = Field(
+        False, description="Delete uploaded file from disk after processing"
+    )
+    async_processing: bool = Field(
+        False, description="Process asynchronously and return immediately with command_id"
+    )
+
+
 class SourceResponse(BaseModel):
     id: str
     title: Optional[str]

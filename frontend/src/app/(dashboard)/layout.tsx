@@ -29,8 +29,13 @@ export default function DashboardLayout({
 
       // Redirect to login if not authenticated
       if (!isAuthenticated) {
-        // Store the current path to redirect back after login
-        const currentPath = window.location.pathname + window.location.search
+        // Store the current path to redirect back after login.
+        // Strip basePath prefix so router.push() doesn't double-prepend it.
+        const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ''
+        const fullPath = window.location.pathname + window.location.search
+        const currentPath = basePath && fullPath.startsWith(basePath)
+          ? fullPath.slice(basePath.length) || '/'
+          : fullPath
         sessionStorage.setItem('redirectAfterLogin', currentPath)
         router.push('/login')
       }

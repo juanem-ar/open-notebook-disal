@@ -21,6 +21,7 @@ from api.models import (
     AssetModel,
     CreateSourceInsightRequest,
     InsightCreationResponse,
+    SourceContentUpdate,
     SourceCreate,
     SourceInsightResponse,
     SourceListResponse,
@@ -776,6 +777,147 @@ async def get_source_status(source_id: str):
         )
 
 
+def parse_source_content_update_form_data(
+    type: str = Form(...),
+    url: Optional[str] = Form(None),
+    content: Optional[str] = Form(None),
+    title: Optional[str] = Form(None),
+    file_path: Optional[str] = Form(None),
+    transformations: Optional[str] = Form(None),  # JSON string of transformation IDs
+    embed: str = Form("true"),          # re-embed by default on content replacement
+    delete_source: str = Form("false"),
+    async_processing: str = Form("false"),
+    file: Optional[UploadFile] = File(None),
+) -> tuple[SourceContentUpdate, Optional[UploadFile]]:
+    """Parse multipart form data into SourceContentUpdate + optional upload file."""
+    import json
+
+    def str_to_bool(value: str) -> bool:
+        return value.lower() in ("true", "1", "yes", "on")
+
+    transformations_list: list[str] = []
+    if transformations:
+        try:
+            transformations_list = json.loads(transformations)
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON in transformations field")
+
+    source_data = SourceContentUpdate(
+        type=type,
+        url=url,
+        content=content,
+        title=title,
+        file_path=file_path,
+        transformations=transformations_list,
+        embed=str_to_bool(embed),
+        delete_source=str_to_bool(delete_source),
+        async_processing=str_to_bool(async_processing),
+    )
+    return source_data, file
+
+
+async def _submit_source_processing(
+    source: Source,
+    content_state: dict,
+    transformations: list,
+    embed: bool,
+    async_processing: bool,
+    old_file_path: Optional[str],
+    new_file_path: Optional[str],
+) -> SourceResponse:
+    """Submit a process_source job (async or sync) and return a SourceResponse.
+
+    Used only by replace_source_content to avoid duplicating the async/sync
+    branching logic from create_source.  Existing notebook edges are preserved
+    (notebook_ids=[] since we are not adding new associations).
+    """
+    import commands.source_commands  # noqa: F401
+
+    command_input = SourceProcessingInput(
+        source_id=str(source.id),
+        content_state=content_state,
+        notebook_ids=[],   # reference edges are already intact; no new ones needed
+        transformations=transformations,
+        embed=embed,
+    )
+
+    def _cleanup_old_file() -> None:
+        """Delete the old file from disk if it differs from the newly uploaded one."""
+        if old_file_path and old_file_path != new_file_path:
+            try:
+                os.unlink(old_file_path)
+                logger.info(f"Deleted old source file: {old_file_path}")
+            except Exception as exc:
+                logger.warning(f"Could not delete old source file {old_file_path}: {exc}")
+
+    if async_processing:
+        command_id = await CommandService.submit_command_job(
+            "open_notebook",
+            "process_source",
+            command_input.model_dump(),
+        )
+        logger.info(f"Submitted replace-content command {command_id} for source {source.id}")
+
+        source.command = ensure_record_id(command_id)
+        await source.save()
+
+        _cleanup_old_file()
+
+        return SourceResponse(
+            id=source.id or "",
+            title=source.title,
+            topics=source.topics or [],
+            asset=AssetModel(
+                file_path=source.asset.file_path if source.asset else None,
+                url=source.asset.url if source.asset else None,
+            ) if source.asset else None,
+            full_text=None,
+            embedded=False,
+            embedded_chunks=0,
+            created=str(source.created),
+            updated=str(source.updated),
+            command_id=command_id,
+            status="queued",
+            processing_info={"replace": True, "queued": True},
+        )
+    else:
+        result = await asyncio.to_thread(
+            execute_command_sync,
+            "open_notebook",
+            "process_source",
+            command_input.model_dump(),
+            timeout=300,
+        )
+
+        if not result.is_success():
+            raise HTTPException(
+                status_code=500,
+                detail=f"Processing failed: {result.error_message}",
+            )
+
+        processed_source = await Source.get(source.id)
+        if not processed_source:
+            raise HTTPException(status_code=500, detail="Processed source not found")
+
+        _cleanup_old_file()
+
+        embedded_chunks = await processed_source.get_embedded_chunks()
+        return SourceResponse(
+            id=processed_source.id or "",
+            title=processed_source.title,
+            topics=processed_source.topics or [],
+            asset=AssetModel(
+                file_path=processed_source.asset.file_path if processed_source.asset else None,
+                url=processed_source.asset.url if processed_source.asset else None,
+            ) if processed_source.asset else None,
+            full_text=processed_source.full_text,
+            embedded=embedded_chunks > 0,
+            embedded_chunks=embedded_chunks,
+            created=str(processed_source.created),
+            updated=str(processed_source.updated),
+        )
+
+
 @router.put("/sources/{source_id}", response_model=SourceResponse)
 async def update_source(source_id: str, source_update: SourceUpdate):
     """Update a source."""
@@ -816,6 +958,178 @@ async def update_source(source_id: str, source_update: SourceUpdate):
     except Exception as e:
         logger.error(f"Error updating source {source_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error updating source: {str(e)}")
+
+
+@router.put("/sources/{source_id}/content", response_model=SourceResponse)
+async def replace_source_content(
+    source_id: str,
+    form_data: tuple[SourceContentUpdate, Optional[UploadFile]] = Depends(
+        parse_source_content_update_form_data
+    ),
+):
+    """Replace the content of an existing source, preserving its ID and notebook links.
+
+    Unlike PUT /sources/{id} (which only updates title/topics), this endpoint
+    replaces the underlying asset (file / URL / text), re-extracts the full
+    text, and re-generates vector embeddings.  Because the source ID stays the
+    same, every notebook that references this source automatically sees the new
+    content — no re-linking required.
+
+    Accepts the same three source types as POST /sources:
+    - **link**: provide ``url``
+    - **upload**: attach a file via multipart ``file`` field
+    - **text**: provide ``content``
+
+    By default ``embed=true`` so vector search is refreshed immediately.
+    Use ``async_processing=true`` to return straight away with a ``command_id``
+    that can be polled via ``GET /sources/{id}/status``.
+    """
+    source_data, upload_file = form_data
+    new_file_path: Optional[str] = None
+
+    try:
+        source = await Source.get(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+
+        # Guard: reject while a job is still running or queued
+        if source.command:
+            try:
+                status = await source.get_status()
+                if status in ["running", "queued"]:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Source is already processing. "
+                            "Cannot replace content while processing is active."
+                        ),
+                    )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning(f"Could not check source status for {source_id}: {exc}")
+
+        # Remember old file path so we can clean it up after success
+        old_file_path: Optional[str] = source.asset.file_path if source.asset else None
+
+        # Save uploaded file (upload type)
+        if upload_file and source_data.type == "upload":
+            try:
+                new_file_path = await save_uploaded_file(upload_file)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"File upload failed: {str(exc)}")
+
+        # Build content_state — mirrors the validation in create_source
+        content_state: dict[str, Any] = {}
+        if source_data.type == "link":
+            if not source_data.url:
+                raise HTTPException(status_code=400, detail="URL is required for link type")
+            content_state["url"] = source_data.url
+        elif source_data.type == "upload":
+            final_file_path = new_file_path or source_data.file_path
+            if not final_file_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="File upload or file_path is required for upload type",
+                )
+            # Anti-LFI: file must live inside the uploads directory
+            uploads_resolved = Path(UPLOADS_FOLDER).resolve()
+            file_resolved = Path(final_file_path).resolve()
+            if not str(file_resolved).startswith(str(uploads_resolved) + os.sep):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid file path: must be within the uploads directory",
+                )
+            content_state["file_path"] = final_file_path
+            content_state["delete_source"] = source_data.delete_source
+        elif source_data.type == "text":
+            if not source_data.content:
+                raise HTTPException(status_code=400, detail="Content is required for text type")
+            content_state["content"] = source_data.content
+        else:
+            raise HTTPException(
+                status_code=400, detail="Invalid source type. Must be link, upload, or text"
+            )
+
+        # Validate transformations
+        transformation_ids = source_data.transformations or []
+        for trans_id in transformation_ids:
+            transformation = await Transformation.get(trans_id)
+            if not transformation:
+                raise HTTPException(status_code=404, detail=f"Transformation {trans_id} not found")
+
+        # Update the asset on the source record
+        if source_data.type == "link":
+            source.asset = Asset(url=source_data.url)
+        elif source_data.type == "upload":
+            source.asset = Asset(file_path=new_file_path or source_data.file_path)
+        else:
+            source.asset = None
+
+        # Optionally rename
+        if source_data.title is not None:
+            source.title = source_data.title
+
+        await source.save()
+
+        # Purge stale insights — content changed so they are no longer valid.
+        # Stale source_embedding rows are handled by embed_source itself (it
+        # deletes and re-inserts), so we don't need to touch them here.
+        try:
+            await repo_query(
+                "DELETE source_insight WHERE source = $source_id",
+                {"source_id": ensure_record_id(source.id)},
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to purge stale insights for source {source_id}: {exc}")
+
+        return await _submit_source_processing(
+            source=source,
+            content_state=content_state,
+            transformations=transformation_ids,
+            embed=source_data.embed,
+            async_processing=source_data.async_processing,
+            old_file_path=old_file_path,
+            new_file_path=new_file_path,
+        )
+
+    except HTTPException:
+        # Clean up the newly uploaded file when the request fails
+        if new_file_path:
+            try:
+                os.unlink(new_file_path)
+            except Exception:
+                pass
+        raise
+    except InvalidInputError as exc:
+        if new_file_path:
+            try:
+                os.unlink(new_file_path)
+            except Exception:
+                pass
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"Error replacing source content for {source_id}: {str(exc)}")
+        if new_file_path:
+            try:
+                os.unlink(new_file_path)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=500, detail=f"Error replacing source content: {str(exc)}"
+        )
+
+
+@router.put("/sources/{source_id}/content/json", response_model=SourceResponse)
+async def replace_source_content_json(source_id: str, source_data: SourceContentUpdate):
+    """Replace source content using a JSON body (for link and text types).
+
+    Convenience variant of PUT /sources/{id}/content that accepts a plain JSON
+    body instead of multipart form data.  Useful when no file upload is needed
+    (i.e. ``type`` is ``link`` or ``text``).
+    """
+    form_data: tuple[SourceContentUpdate, Optional[UploadFile]] = (source_data, None)
+    return await replace_source_content(source_id, form_data)
 
 
 @router.post("/sources/{source_id}/retry", response_model=SourceResponse)

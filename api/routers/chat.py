@@ -14,13 +14,21 @@ from open_notebook.exceptions import (
 )
 from open_notebook.graphs.chat import graph as chat_graph
 from open_notebook.utils.graph_utils import get_session_message_count
+from api.multi_chat_service import (
+    build_multi_notebook_context,
+    execute_multi_chat,
+    get_or_create_session,
+)
 
 router = APIRouter()
 
 
 # Request/Response models
 class CreateSessionRequest(BaseModel):
-    notebook_id: str = Field(..., description="Notebook ID to create session for")
+    notebook_id: Optional[str] = Field(None, description="Notebook ID (single-notebook chat)")
+    notebook_ids: Optional[List[str]] = Field(
+        None, description="Notebook IDs for multi-notebook chat"
+    )
     title: Optional[str] = Field(None, description="Optional session title")
     model_override: Optional[str] = Field(
         None, description="Optional model override for this session"
@@ -136,22 +144,44 @@ async def get_sessions(notebook_id: str = Query(..., description="Notebook ID"))
 
 @router.post("/chat/sessions", response_model=ChatSessionResponse)
 async def create_session(request: CreateSessionRequest):
-    """Create a new chat session."""
+    """Create a new chat session (single-notebook or multi-notebook)."""
     try:
-        # Verify notebook exists
+        # Multi-notebook path: notebook_ids provided (no notebook validation needed)
+        if request.notebook_ids:
+            session = ChatSession(
+                title=request.title
+                or f"Chat Session {asyncio.get_event_loop().time():.0f}",
+                model_override=request.model_override,
+                notebook_ids=request.notebook_ids,
+            )
+            await session.save()
+            return ChatSessionResponse(
+                id=session.id or "",
+                title=session.title or "",
+                notebook_id=request.notebook_id,
+                created=str(session.created),
+                updated=str(session.updated),
+                message_count=0,
+                model_override=session.model_override,
+            )
+
+        # Single-notebook path (original behaviour)
+        if not request.notebook_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Either notebook_id or notebook_ids must be provided",
+            )
+
         notebook = await Notebook.get(request.notebook_id)
         if not notebook:
             raise HTTPException(status_code=404, detail="Notebook not found")
 
-        # Create new session
         session = ChatSession(
             title=request.title
             or f"Chat Session {asyncio.get_event_loop().time():.0f}",
             model_override=request.model_override,
         )
         await session.save()
-
-        # Relate session to notebook
         await session.relate_to_notebook(request.notebook_id)
 
         return ChatSessionResponse(
@@ -165,6 +195,8 @@ async def create_session(request: CreateSessionRequest):
         )
     except NotFoundError:
         raise HTTPException(status_code=404, detail="Notebook not found")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating chat session: {str(e)}")
         raise HTTPException(
@@ -524,3 +556,162 @@ async def build_context(request: BuildContextRequest):
     except Exception as e:
         logger.error(f"Error building context: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error building context: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Multi-notebook chat schemas
+# ---------------------------------------------------------------------------
+
+class MultiExecuteChatRequest(BaseModel):
+    session_id: str = Field(..., description="Chat session ID (must already exist)")
+    message: str = Field(..., description="User message")
+    model_override: Optional[str] = Field(None, description="Optional model override")
+
+
+class AskRequest(BaseModel):
+    session_id: str = Field(
+        ...,
+        description=(
+            "Persistent session identifier. If the session does not exist it will "
+            "be created automatically. Use the Teams conversationId here so each "
+            "Teams conversation gets its own memory."
+        ),
+    )
+    message: str = Field(..., description="User message / question")
+    notebook_ids: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Notebooks to include in context. Required on first call. "
+            "Subsequent calls may omit this to reuse the session's stored list."
+        ),
+    )
+    model_override: Optional[str] = Field(None, description="Optional model override")
+
+
+class AskResponse(BaseModel):
+    session_id: str = Field(..., description="Session ID (same as input)")
+    reply: str = Field(..., description="AI reply text")
+
+
+# ---------------------------------------------------------------------------
+# POST /chat/multi/execute  — UI-oriented multi-notebook chat
+# ---------------------------------------------------------------------------
+
+@router.post("/chat/multi/execute", response_model=ExecuteChatResponse)
+async def multi_execute_chat(request: MultiExecuteChatRequest):
+    """
+    Execute a chat turn against a multi-notebook session.
+
+    The server builds context from all notebooks linked to the session and
+    returns the full updated message list (same format as /chat/execute).
+    """
+    try:
+        full_session_id = (
+            request.session_id
+            if request.session_id.startswith("chat_session:")
+            else f"chat_session:{request.session_id}"
+        )
+        session = await ChatSession.get(full_session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        result = await execute_multi_chat(
+            session=session,
+            message=request.message,
+            model_override=request.model_override,
+        )
+
+        messages: list[ChatMessage] = []
+        for msg in result.get("messages", []):
+            messages.append(
+                ChatMessage(
+                    id=getattr(msg, "id", f"msg_{len(messages)}"),
+                    type=msg.type if hasattr(msg, "type") else "unknown",
+                    content=msg.content if hasattr(msg, "content") else str(msg),
+                    timestamp=None,
+                )
+            )
+
+        return ExecuteChatResponse(session_id=request.session_id, messages=messages)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error in multi execute chat: {str(e)}\n"
+            f"  Session ID: {request.session_id}\n"
+            f"  Traceback:\n{traceback.format_exc()}"
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Error in multi chat: {str(e)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /chat/ask  — n8n / Teams integration endpoint
+# ---------------------------------------------------------------------------
+
+@router.post("/chat/ask", response_model=AskResponse)
+async def ask(request: AskRequest):
+    """
+    Simple request/response endpoint designed for external automation (n8n, Teams).
+
+    - Auto-creates a session the first time *session_id* is seen.
+    - Builds context server-side from the session's stored notebooks.
+    - Returns only the AI reply text (no full message history).
+
+    Authentication: ``Authorization: Bearer <OPEN_NOTEBOOK_PASSWORD>``
+    (same as all other endpoints).
+    """
+    try:
+        if not request.notebook_ids:
+            # Try to derive notebook_ids from existing session
+            full_id = (
+                request.session_id
+                if request.session_id.startswith("chat_session:")
+                else f"chat_session:{request.session_id}"
+            )
+            existing: Optional[ChatSession] = None
+            try:
+                existing = await ChatSession.get(full_id)
+            except Exception:
+                pass
+            if existing is None or not existing.notebook_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "notebook_ids is required when creating a new session or "
+                        "when the existing session has no linked notebooks."
+                    ),
+                )
+
+        session = await get_or_create_session(
+            session_id=request.session_id,
+            notebook_ids=request.notebook_ids,
+            model_override=request.model_override,
+        )
+
+        result = await execute_multi_chat(
+            session=session,
+            message=request.message,
+            notebook_ids=request.notebook_ids,
+            model_override=request.model_override,
+        )
+
+        # Extract the last AI message as the reply
+        reply = ""
+        for msg in reversed(result.get("messages", [])):
+            msg_type = getattr(msg, "type", None)
+            if msg_type == "ai":
+                reply = msg.content if hasattr(msg, "content") else str(msg)
+                break
+
+        return AskResponse(session_id=request.session_id, reply=reply)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error in /chat/ask: {str(e)}\n"
+            f"  Session ID: {request.session_id}\n"
+            f"  Traceback:\n{traceback.format_exc()}"
+        )
+        raise HTTPException(status_code=500, detail=f"Error in /chat/ask: {str(e)}")

@@ -1,6 +1,8 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ''
 import Link from 'next/link'
 import Image from 'next/image'
 import { usePathname } from 'next/navigation'
@@ -41,6 +43,7 @@ import {
   Plus,
   Wrench,
   Command,
+  MessageSquare,
 } from 'lucide-react'
 
 const getNavigation = (t: TFunction) => [
@@ -54,6 +57,7 @@ const getNavigation = (t: TFunction) => [
     title: t('navigation.process'),
     items: [
       { name: t('navigation.notebooks'), href: '/notebooks', icon: Book },
+      { name: t('navigation.multiChat'), href: '/multi-chat', icon: MessageSquare },
       { name: t('navigation.askAndSearch'), href: '/search', icon: Search },
     ],
   },
@@ -121,10 +125,11 @@ export function AppSidebar() {
           {isCollapsed ? (
             <div className="relative flex items-center justify-center w-full">
               <Image
-                src="/logo.svg"
-                alt="Open Notebook"
-                width={32}
-                height={32}
+                src={`${basePath}/logo.svg`}
+                alt="Disal"
+                width={48}
+                height={12}
+                unoptimized
                 className="transition-opacity group-hover:opacity-0"
               />
               <Button
@@ -138,11 +143,8 @@ export function AppSidebar() {
             </div>
           ) : (
             <>
-              <div className="flex items-center gap-2">
-                <Image src="/logo.svg" alt={t('common.appName')} width={32} height={32} />
-                <span className="text-base font-medium text-sidebar-foreground">
-                  {t('common.appName')}
-                </span>
+              <div className="flex items-center">
+                <Image src={`${basePath}/logo.svg`} alt="Disal" width={160} height={38} unoptimized />
               </div>
               <Button
                 variant="ghost"
