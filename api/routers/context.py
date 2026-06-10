@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from loguru import logger
 
-from api.models import ContextRequest, ContextResponse
+from api.models import ContextConfig, ContextRequest, ContextResponse
 from open_notebook.domain.notebook import Note, Notebook, Source
 from open_notebook.exceptions import InvalidInputError
 from open_notebook.utils import token_count
@@ -18,6 +18,15 @@ async def get_notebook_context(notebook_id: str, context_request: ContextRequest
         if not notebook:
             raise HTTPException(status_code=404, detail="Notebook not found")
 
+        # Load persisted context_config — "not in" is authoritative
+        saved_cfg = notebook.context_config or {}
+        saved_sources: dict[str, str] = {
+            str(k): str(v) for k, v in saved_cfg.get("sources", {}).items()
+        }
+        saved_notes: dict[str, str] = {
+            str(k): str(v) for k, v in saved_cfg.get("notes", {}).items()
+        }
+
         context_data: dict[str, list[dict[str, str]]] = {"note": [], "source": []}
         total_content = ""
 
@@ -25,17 +34,16 @@ async def get_notebook_context(notebook_id: str, context_request: ContextRequest
         if context_request.context_config:
             # Process sources
             for source_id, status in context_request.context_config.sources.items():
-                if "not in" in status:
+                full_source_id = (
+                    source_id
+                    if source_id.startswith("source:")
+                    else f"source:{source_id}"
+                )
+                saved_status = saved_sources.get(full_source_id, "")
+                if "not in" in saved_status or "not in" in status:
                     continue
 
                 try:
-                    # Add table prefix if not present
-                    full_source_id = (
-                        source_id
-                        if source_id.startswith("source:")
-                        else f"source:{source_id}"
-                    )
-
                     try:
                         source = await Source.get(full_source_id)
                     except Exception:
@@ -55,14 +63,14 @@ async def get_notebook_context(notebook_id: str, context_request: ContextRequest
 
             # Process notes
             for note_id, status in context_request.context_config.notes.items():
-                if "not in" in status:
+                full_note_id = (
+                    note_id if note_id.startswith("note:") else f"note:{note_id}"
+                )
+                saved_status = saved_notes.get(full_note_id, "")
+                if "not in" in saved_status or "not in" in status:
                     continue
 
                 try:
-                    # Add table prefix if not present
-                    full_note_id = (
-                        note_id if note_id.startswith("note:") else f"note:{note_id}"
-                    )
                     note = await Note.get(full_note_id)
                     if not note:
                         continue
@@ -75,11 +83,16 @@ async def get_notebook_context(notebook_id: str, context_request: ContextRequest
                     logger.warning(f"Error processing note {note_id}: {str(e)}")
                     continue
         else:
-            # Default behavior - include all sources and notes with short context
+            # No frontend config — use saved config; fall back to all sources/notes
             sources = await notebook.get_sources()
             for source in sources:
                 try:
-                    source_context = await source.get_context(context_size="short")
+                    src_id = str(source.id)
+                    saved_status = saved_sources.get(src_id, "insights")
+                    if "not in" in saved_status:
+                        continue
+                    size = "long" if "full content" in saved_status else "short"
+                    source_context = await source.get_context(context_size=size)
                     context_data["source"].append(source_context)
                     total_content += str(source_context)
                 except Exception as e:
@@ -89,7 +102,12 @@ async def get_notebook_context(notebook_id: str, context_request: ContextRequest
             notes = await notebook.get_notes()
             for note in notes:
                 try:
-                    note_context = note.get_context(context_size="short")
+                    note_id = str(note.id)
+                    saved_status = saved_notes.get(note_id, "full content")
+                    if "not in" in saved_status:
+                        continue
+                    size = "long" if "full content" in saved_status else "short"
+                    note_context = note.get_context(context_size=size)
                     context_data["note"].append(note_context)
                     total_content += str(note_context)
                 except Exception as e:
@@ -113,3 +131,23 @@ async def get_notebook_context(notebook_id: str, context_request: ContextRequest
     except Exception as e:
         logger.error(f"Error getting context for notebook {notebook_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error getting context: {str(e)}")
+
+
+@router.put("/notebooks/{notebook_id}/context-config", status_code=204)
+async def save_notebook_context_config(notebook_id: str, context_config: ContextConfig):
+    """Persist the context configuration for a notebook."""
+    try:
+        notebook = await Notebook.get(notebook_id)
+        if not notebook:
+            raise HTTPException(status_code=404, detail="Notebook not found")
+
+        notebook.context_config = {
+            "sources": context_config.sources,
+            "notes": context_config.notes,
+        }
+        await notebook.save()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving context config for notebook {notebook_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error saving context config: {str(e)}")

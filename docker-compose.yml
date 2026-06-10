@@ -22,7 +22,7 @@ services:
       # REQUIRED: Change this to your own secret string
       # This encrypts your API keys in the database
       - OPEN_NOTEBOOK_ENCRYPTION_KEY=change-me-to-a-secret-string
-
+      - OPEN_NOTEBOOK_PASSWORD=+jLwDhPNZaGro4YsRDiIPho/rAGJAcdQ
       # Database connection (default values - no need to change)
       - SURREAL_URL=ws://surrealdb:8000/rpc
       - SURREAL_USER=root

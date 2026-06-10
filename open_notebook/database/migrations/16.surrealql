@@ -1,0 +1,6 @@
+-- Migration 16: Fix context_config field to use FLEXIBLE so SurrealDB preserves
+-- arbitrary nested keys (source/note IDs) in the object.
+-- Without FLEXIBLE, SurrealDB SCHEMAFULL silently drops sub-fields that are not
+-- explicitly defined, resulting in context_config always being stored as {}.
+
+DEFINE FIELD IF NOT EXISTS context_config ON TABLE notebook FLEXIBLE TYPE option<object>;

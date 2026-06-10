@@ -4,13 +4,38 @@ import { useState } from 'react'
 import { NotebookResponse } from '@/lib/types/api'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Archive, ArchiveRestore, Trash2 } from 'lucide-react'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Archive, ArchiveRestore, Trash2, Timer } from 'lucide-react'
 import { useUpdateNotebook } from '@/lib/hooks/use-notebooks'
 import { NotebookDeleteDialog } from './NotebookDeleteDialog'
 import { formatDistanceToNow } from 'date-fns'
 import { getDateLocale } from '@/lib/utils/date-locale'
 import { InlineEdit } from '@/components/common/InlineEdit'
 import { useTranslation } from '@/lib/hooks/use-translation'
+
+/** Available TTL options for /chat/ask sessions. */
+const TTL_OPTIONS: { label: string; value: number | null; description?: string }[] = [
+  { label: 'Sin memoria', value: 0, description: 'Cada respuesta inicia sesión nueva' },
+  { label: 'Permanente', value: null, description: 'La sesión nunca expira' },
+  { label: '3 minutos', value: 3 },
+  { label: '10 minutos', value: 10 },
+  { label: '30 minutos', value: 30 },
+  { label: '1 hora', value: 60 },
+]
+
+function ttlLabel(minutes: number | null | undefined): string {
+  if (minutes === 0) return 'Sin memoria'
+  if (minutes == null) return 'Permanente'
+  const opt = TTL_OPTIONS.find(o => o.value === minutes)
+  return opt ? opt.label : `${minutes} min`
+}
 
 interface NotebookHeaderProps {
   notebook: NotebookResponse
@@ -48,6 +73,14 @@ export function NotebookHeader({ notebook }: NotebookHeaderProps) {
     })
   }
 
+  const handleTtlChange = (minutes: number | null) => {
+    updateNotebook.mutate({
+      id: notebook.id,
+      // Send -1 as sentinel for "clear TTL" (backend converts -1 → null).
+      data: { session_ttl_minutes: minutes === null ? -1 : minutes }
+    })
+  }
+
   return (
     <>
       <div className="border-b pb-6">
@@ -68,6 +101,42 @@ export function NotebookHeader({ notebook }: NotebookHeaderProps) {
               )}
             </div>
             <div className="flex gap-2">
+              {/* Session TTL selector for /chat/ask integrations */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm" title="Duración de sesión (chat/ask)">
+                    <Timer className="h-4 w-4 mr-2" />
+                    {ttlLabel(notebook.session_ttl_minutes)}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-48">
+                  <DropdownMenuLabel className="text-xs text-muted-foreground font-normal">
+                    Duración de sesión (/chat/ask)
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  {TTL_OPTIONS.map(opt => {
+                    const isActive = (notebook.session_ttl_minutes ?? null) === opt.value
+                    return (
+                      <DropdownMenuItem
+                        key={String(opt.value)}
+                        onClick={() => handleTtlChange(opt.value)}
+                        className={isActive ? 'font-semibold' : ''}
+                      >
+                        <div className="flex flex-col">
+                          <span>{opt.label}</span>
+                          {opt.description && (
+                            <span className="text-[10px] text-muted-foreground">{opt.description}</span>
+                          )}
+                        </div>
+                        {isActive && (
+                          <span className="ml-auto text-primary">✓</span>
+                        )}
+                      </DropdownMenuItem>
+                    )
+                  })}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
               <Button
                 variant="outline"
                 size="sm"

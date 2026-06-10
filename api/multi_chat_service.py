@@ -8,15 +8,42 @@ Centralises the logic shared by:
 
 import asyncio
 import re
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from loguru import logger
 
-from open_notebook.domain.notebook import ChatSession, Notebook
+from open_notebook.config import LANGGRAPH_CHECKPOINT_FILE
+from open_notebook.domain.notebook import ChatSession, Note, Notebook
 from open_notebook.graphs.chat import graph as chat_graph
+
+
+def _purge_thread_checkpoints(thread_id: str) -> None:
+    """
+    Delete all LangGraph checkpoint rows for *thread_id* from the SQLite store.
+
+    Called when a session resets (TTL expiry or no-memory mode) so the next
+    conversation starts with a clean slate instead of loading old messages.
+    Errors are swallowed — a stale checkpoint is preferable to a crash.
+    """
+    try:
+        with sqlite3.connect(LANGGRAPH_CHECKPOINT_FILE) as conn:
+            cur = conn.cursor()
+            # LangGraph SqliteSaver uses 'checkpoints' and 'writes' tables.
+            cur.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+            deleted_cp = cur.rowcount
+            cur.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+            deleted_wr = cur.rowcount
+            conn.commit()
+            logger.info(
+                f"Purged LangGraph state for thread {thread_id!r}: "
+                f"{deleted_cp} checkpoints, {deleted_wr} writes."
+            )
+    except Exception as exc:
+        logger.warning(f"Could not purge checkpoints for {thread_id!r}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +72,11 @@ async def build_multi_notebook_context(
             logger.warning(f"Could not load notebook {notebook_id}: {exc}")
             continue
 
+        saved_cfg = notebook.context_config or {}
+        # Normalise keys to strings in case SurrealDB returned RecordID objects
+        source_cfg: dict = {str(k): str(v) for k, v in saved_cfg.get("sources", {}).items()}
+        note_cfg: dict = {str(k): str(v) for k, v in saved_cfg.get("notes", {}).items()}
+
         # Sources
         try:
             sources = await notebook.get_sources()
@@ -54,7 +86,12 @@ async def build_multi_notebook_context(
 
         for source in sources:
             try:
-                src_ctx = await source.get_context(context_size="short")
+                src_id = str(source.id)
+                status = source_cfg.get(src_id, "insights")
+                if "not in" in status:
+                    continue
+                size = "long" if "full content" in status else "short"
+                src_ctx = await source.get_context(context_size=size)
                 context_data["sources"].append(src_ctx)
                 total_content += str(src_ctx)
             except Exception as exc:
@@ -69,7 +106,16 @@ async def build_multi_notebook_context(
 
         for note in notes:
             try:
-                note_ctx = note.get_context(context_size="short")
+                note_id = str(note.id)
+                status = note_cfg.get(note_id, "full content")
+                if "not in" in status:
+                    continue
+                # get_notes() omits content for performance; refetch the full record
+                full_note = await Note.get(note_id)
+                if not full_note:
+                    continue
+                size = "long" if "full content" in status else "short"
+                note_ctx = full_note.get_context(context_size=size)
                 context_data["notes"].append(note_ctx)
                 total_content += str(note_ctx)
             except Exception as exc:
@@ -94,6 +140,23 @@ async def build_multi_notebook_context(
 # Session helpers
 # ---------------------------------------------------------------------------
 
+async def _get_min_ttl_minutes(notebook_ids: List[str]) -> Optional[int]:
+    """
+    Return the smallest session_ttl_minutes across *notebook_ids*, or None if
+    all notebooks have permanent sessions (TTL not configured).
+    """
+    min_ttl: Optional[int] = None
+    for nb_id in notebook_ids:
+        try:
+            nb = await Notebook.get(nb_id)
+            if nb and nb.session_ttl_minutes is not None:
+                if min_ttl is None or nb.session_ttl_minutes < min_ttl:
+                    min_ttl = nb.session_ttl_minutes
+        except Exception:
+            pass
+    return min_ttl
+
+
 async def get_or_create_session(
     session_id: str,
     notebook_ids: Optional[List[str]] = None,
@@ -105,6 +168,11 @@ async def get_or_create_session(
 
     When creating, ``notebook_ids`` and ``model_override`` are stored on the
     record so subsequent calls can omit them.
+
+    If any notebook has a ``session_ttl_minutes`` configured and the session
+    has been idle for longer than that TTL, the session is auto-reset by
+    incrementing its ``session_version``.  The next ``execute_multi_chat``
+    call will use a new LangGraph thread, starting a fresh conversation.
     """
     # Normalize to a bare SurrealDB identifier (only alphanumeric + underscore).
     # Hyphens and other special chars in the ID part cause SurrealDB parse errors
@@ -127,20 +195,59 @@ async def get_or_create_session(
             title=title,
             model_override=model_override,
             notebook_ids=notebook_ids,
+            session_version=0,
             created=datetime.now(),
         )
         await session.save()
         logger.info(f"Created new multi-chat session {session.id}")
     else:
-        # Persist any new notebook_ids / model_override provided by the caller
-        updated = False
+        # Check TTL expiry against the effective notebook list
+        ttl_bumped = False
+        effective_nb_ids = notebook_ids or session.notebook_ids or []
+        if effective_nb_ids:
+            min_ttl = await _get_min_ttl_minutes(effective_nb_ids)
+            if min_ttl is not None and min_ttl > 0:
+                last_activity = session.updated or session.created
+                if last_activity is not None:
+                    now_utc = datetime.now(timezone.utc)
+                    if last_activity.tzinfo is None:
+                        last_utc = last_activity.replace(tzinfo=timezone.utc)
+                    else:
+                        last_utc = last_activity
+                    age_seconds = (now_utc - last_utc).total_seconds()
+                    if age_seconds > min_ttl * 60:
+                        # Compute the old thread_id so we can wipe its checkpoints
+                        old_version = session.session_version or 0
+                        old_full_id = (
+                            str(session.id)
+                            if str(session.id).startswith("chat_session:")
+                            else f"chat_session:{session.id}"
+                        )
+                        old_thread_id = (
+                            f"{old_full_id}_v{old_version}"
+                            if old_version > 0
+                            else old_full_id
+                        )
+                        # Purge stale LangGraph state before bumping the version
+                        await asyncio.to_thread(_purge_thread_checkpoints, old_thread_id)
+
+                        session.session_version = old_version + 1
+                        ttl_bumped = True
+                        logger.info(
+                            f"Session {session_id!r} expired "
+                            f"(TTL={min_ttl}min, idle={age_seconds:.0f}s). "
+                            f"Bumped to v{session.session_version} — fresh thread."
+                        )
+
+        # Persist any changes
+        needs_save = ttl_bumped
         if notebook_ids is not None and notebook_ids != session.notebook_ids:
             session.notebook_ids = notebook_ids
-            updated = True
+            needs_save = True
         if model_override is not None and model_override != session.model_override:
             session.model_override = model_override
-            updated = True
-        if updated:
+            needs_save = True
+        if needs_save:
             await session.save()
 
     return session
@@ -175,6 +282,11 @@ async def execute_multi_chat(
         else f"chat_session:{session.id}"
     )
 
+    # Build a versioned LangGraph thread_id so TTL-reset sessions start with
+    # a fresh checkpoint (no old conversation history).
+    version = session.session_version or 0
+    thread_id = f"{full_session_id}_v{version}" if version > 0 else full_session_id
+
     # Build context from all selected notebooks
     context_result = await build_multi_notebook_context(effective_notebook_ids)
     context = context_result["context"]
@@ -182,7 +294,7 @@ async def execute_multi_chat(
     # Retrieve current LangGraph checkpoint state
     current_state = await asyncio.to_thread(
         chat_graph.get_state,
-        config=RunnableConfig(configurable={"thread_id": full_session_id}),
+        config=RunnableConfig(configurable={"thread_id": thread_id}),
     )
 
     state_values = current_state.values if current_state else {}
@@ -197,13 +309,27 @@ async def execute_multi_chat(
         input=state_values,
         config=RunnableConfig(
             configurable={
-                "thread_id": full_session_id,
+                "thread_id": thread_id,
                 "model_id": effective_model,
             }
         ),
     )
 
-    # Keep session timestamp fresh
+    # If any notebook is configured as "no memory" (TTL=0), purge the checkpoint
+    # that was just written and bump session_version so the NEXT request uses a
+    # brand-new LangGraph thread with no prior messages.
+    if effective_notebook_ids:
+        min_ttl = await _get_min_ttl_minutes(effective_notebook_ids)
+        if min_ttl is not None and min_ttl == 0:
+            # Purge the thread we just used
+            await asyncio.to_thread(_purge_thread_checkpoints, thread_id)
+            session.session_version = (session.session_version or 0) + 1
+            logger.info(
+                f"No-memory session {session.id!r}: purged thread {thread_id!r}, "
+                f"bumped to v{session.session_version} — next call will start fresh."
+            )
+
+    # Keep session timestamp fresh (also persists any version bump above)
     await session.save()
 
     return result

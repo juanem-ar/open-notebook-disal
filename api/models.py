@@ -15,6 +15,14 @@ class NotebookUpdate(BaseModel):
     archived: Optional[bool] = Field(
         None, description="Whether the notebook is archived"
     )
+    session_ttl_minutes: Optional[int] = Field(
+        None,
+        description=(
+            "TTL for /chat/ask sessions in minutes. "
+            "null = permanent (never auto-reset). "
+            "Common values: 3, 10, 30, 60."
+        ),
+    )
 
 
 class NotebookResponse(BaseModel):
@@ -26,6 +34,8 @@ class NotebookResponse(BaseModel):
     updated: str
     source_count: int
     note_count: int
+    context_config: Optional[Dict[str, Any]] = None
+    session_ttl_minutes: Optional[int] = None
 
 
 # Search models

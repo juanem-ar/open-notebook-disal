@@ -1,0 +1,3 @@
+-- Migration 17 down: Revert to non-flexible object type.
+
+DEFINE FIELD OVERWRITE context_config ON TABLE notebook TYPE option<object>;

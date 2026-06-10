@@ -91,6 +91,16 @@ export const chatApi = {
     }>(`/chat/multi/execute`, data)
     return response.data
   },
+
+  clearAllSessions: async () => {
+    const response = await apiClient.delete<{
+      success: boolean
+      sessions_deleted: number
+      checkpoints_deleted: number
+      writes_deleted: number
+    }>(`/chat/sessions`)
+    return response.data
+  },
 }
 
 export default chatApi

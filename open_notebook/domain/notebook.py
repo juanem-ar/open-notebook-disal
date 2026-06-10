@@ -18,6 +18,9 @@ class Notebook(ObjectModel):
     name: str
     description: str
     archived: Optional[bool] = False
+    context_config: Optional[Dict[str, Any]] = None
+    # TTL for /chat/ask sessions in minutes. None = permanent (never auto-reset).
+    session_ttl_minutes: Optional[int] = None
 
     @field_validator("name")
     @classmethod
@@ -616,6 +619,10 @@ class ChatSession(ObjectModel):
     title: Optional[str] = None
     model_override: Optional[str] = None
     notebook_ids: Optional[List[str]] = None
+    # Incremented each time the session is auto-reset due to TTL expiry.
+    # The LangGraph thread_id is suffixed with "_v{session_version}" so each
+    # reset starts a fresh conversation without deleting the old checkpoint.
+    session_version: int = 0
 
     async def relate_to_notebook(self, notebook_id: str) -> Any:
         if not notebook_id:

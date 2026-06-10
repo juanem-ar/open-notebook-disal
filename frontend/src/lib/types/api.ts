@@ -1,3 +1,8 @@
+export interface NotebookContextConfig {
+  sources: Record<string, string>
+  notes: Record<string, string>
+}
+
 export interface NotebookResponse {
   id: string
   name: string
@@ -7,6 +12,9 @@ export interface NotebookResponse {
   updated: string
   source_count: number
   note_count: number
+  context_config?: NotebookContextConfig
+  /** TTL for /chat/ask sessions in minutes. null/undefined = permanent. */
+  session_ttl_minutes?: number | null
 }
 
 export interface NoteResponse {
@@ -69,6 +77,8 @@ export interface UpdateNotebookRequest {
   name?: string
   description?: string
   archived?: boolean
+  /** Minutes before /chat/ask session auto-resets. -1 = clear (permanent). */
+  session_ttl_minutes?: number
 }
 
 export interface NotebookDeletePreview {

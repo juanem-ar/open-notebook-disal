@@ -140,6 +140,16 @@ async function fetchConfig(): Promise<AppConfig> {
 }
 
 /**
+ * Return the cached API URL synchronously, or null if config hasn't been
+ * fetched yet.  Use this only in contexts where an async call is not
+ * possible (e.g. beforeunload handlers, useEffect cleanups during page
+ * unload).  For normal usage prefer getApiUrl().
+ */
+export function getCachedApiUrlSync(): string | null {
+  return config?.apiUrl ?? null
+}
+
+/**
  * Reset the configuration cache (useful for testing).
  */
 export function resetConfig(): void {

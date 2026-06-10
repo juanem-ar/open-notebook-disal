@@ -170,6 +170,8 @@ async def get_notebook(notebook_id: str):
             updated=str(nb.get("updated", "")),
             source_count=nb.get("source_count", 0),
             note_count=nb.get("note_count", 0),
+            context_config=nb.get("context_config"),
+            session_ttl_minutes=nb.get("session_ttl_minutes"),
         )
     except HTTPException:
         raise
@@ -195,6 +197,13 @@ async def update_notebook(notebook_id: str, notebook_update: NotebookUpdate):
             notebook.description = notebook_update.description
         if notebook_update.archived is not None:
             notebook.archived = notebook_update.archived
+        # session_ttl_minutes uses explicit sentinel: -1 means "set to None (permanent)"
+        if notebook_update.session_ttl_minutes is not None:
+            # Treat -1 as "clear the TTL" (set to None/permanent)
+            notebook.session_ttl_minutes = (
+                None if notebook_update.session_ttl_minutes == -1
+                else notebook_update.session_ttl_minutes
+            )
 
         await notebook.save()
 
@@ -218,6 +227,8 @@ async def update_notebook(notebook_id: str, notebook_update: NotebookUpdate):
                 updated=str(nb.get("updated", "")),
                 source_count=nb.get("source_count", 0),
                 note_count=nb.get("note_count", 0),
+                context_config=nb.get("context_config"),
+                session_ttl_minutes=nb.get("session_ttl_minutes"),
             )
 
         # Fallback if query fails
@@ -230,6 +241,7 @@ async def update_notebook(notebook_id: str, notebook_update: NotebookUpdate):
             updated=str(notebook.updated),
             source_count=0,
             note_count=0,
+            session_ttl_minutes=notebook.session_ttl_minutes,
         )
     except HTTPException:
         raise

@@ -1,7 +1,8 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams } from 'next/navigation'
+import { useQueryClient } from '@tanstack/react-query'
 import { AppShell } from '@/components/layout/AppShell'
 import { NotebookHeader } from '../components/NotebookHeader'
 import { SourcesColumn } from '../components/SourcesColumn'
@@ -17,6 +18,9 @@ import { useTranslation } from '@/lib/hooks/use-translation'
 import { cn } from '@/lib/utils'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { FileText, StickyNote, MessageSquare } from 'lucide-react'
+import { notebooksApi } from '@/lib/api/notebooks'
+import { QUERY_KEYS } from '@/lib/api/query-client'
+import { NotebookResponse } from '@/lib/types/api'
 
 export type ContextMode = 'off' | 'insights' | 'full'
 
@@ -57,22 +61,59 @@ export default function NotebookPage() {
     sources: {},
     notes: {}
   })
+  // Track the JSON of the last context_config we applied from the server, to avoid
+  // re-applying the same config on every background refetch and to detect when
+  // a fresh refetch brings a different (newer) config.
+  const lastAppliedConfigRef = useRef<string | null>(null)
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const queryClient = useQueryClient()
 
-  // Initialize and update selections when sources load or change
+  // Apply saved context_config from notebook whenever the server data changes.
+  // We compare the JSON of the incoming config against what we last applied so
+  // that: (a) we DO re-apply after a background refetch returns a newer config,
+  // and (b) we DON'T clobber in-session changes after we update the cache ourselves.
+  useEffect(() => {
+    if (!notebook) return
+    const incomingConfigJson = notebook.context_config
+      ? JSON.stringify(notebook.context_config)
+      : null
+
+    // Skip if this is exactly the same config we already applied
+    if (incomingConfigJson === lastAppliedConfigRef.current) return
+    lastAppliedConfigRef.current = incomingConfigJson
+
+    if (notebook.context_config) {
+      const saved = notebook.context_config
+      const toMode = (val: string): ContextMode =>
+        val === 'full content' ? 'full' : val === 'not in' ? 'off' : 'insights'
+      setContextSelections(prev => ({
+        sources: {
+          ...prev.sources,
+          ...Object.fromEntries(
+            Object.entries(saved.sources || {}).map(([id, val]) => [id, toMode(val as string)])
+          ),
+        },
+        notes: {
+          ...prev.notes,
+          ...Object.fromEntries(
+            Object.entries(saved.notes || {}).map(([id, val]) => [id, toMode(val as string)])
+          ),
+        },
+      }))
+    }
+  }, [notebook])
+
+  // Initialize selections when sources load or change.
+  // Only sets a default for sources that have no mode yet; saved config
+  // (applied by the notebook effect above) always takes precedence.
   useEffect(() => {
     if (sources && sources.length > 0) {
       setContextSelections(prev => {
         const newSourceSelections = { ...prev.sources }
         sources.forEach(source => {
-          const currentMode = newSourceSelections[source.id]
-          const hasInsights = source.insights_count > 0
-
-          if (currentMode === undefined) {
-            // Initial setup - default based on insights availability
+          if (newSourceSelections[source.id] === undefined) {
+            const hasInsights = source.insights_count > 0
             newSourceSelections[source.id] = hasInsights ? 'insights' : 'full'
-          } else if (currentMode === 'full' && hasInsights) {
-            // Source gained insights while in 'full' mode - auto-switch to 'insights'
-            newSourceSelections[source.id] = 'insights'
           }
         })
         return { ...prev, sources: newSourceSelections }
@@ -85,9 +126,7 @@ export default function NotebookPage() {
       setContextSelections(prev => {
         const newNoteSelections = { ...prev.notes }
         notes.forEach(note => {
-          // Only set default if not already set
           if (!(note.id in newNoteSelections)) {
-            // Notes default to 'full'
             newNoteSelections[note.id] = 'full'
           }
         })
@@ -96,15 +135,92 @@ export default function NotebookPage() {
     }
   }, [notes])
 
+  // Helper: build the API payload and save using fetch with keepalive:true.
+  // keepalive ensures the request completes even if the user triggers a full
+  // page reload (F5) immediately after toggling — which would otherwise cancel
+  // a regular axios/fetch request before it reaches the server.
+  // Also updates the TanStack Query cache for instant subsequent loads.
+  const doSaveContextConfig = useCallback((selections: ContextSelections) => {
+    const toApiValue = (mode: ContextMode) =>
+      mode === 'full' ? 'full content' : mode === 'off' ? 'not in' : 'insights'
+    const contextConfig = {
+      sources: Object.fromEntries(
+        Object.entries(selections.sources).map(([id, mode]) => [id, toApiValue(mode)])
+      ),
+      notes: Object.fromEntries(
+        Object.entries(selections.notes).map(([id, mode]) => [id, toApiValue(mode)])
+      ),
+    }
+    // Use keepalive fetch so the save survives F5 / navigation
+    notebooksApi.saveContextConfigKeepalive(notebookId, contextConfig)
+    // Optimistically update cache and ref regardless of network outcome
+    lastAppliedConfigRef.current = JSON.stringify(contextConfig)
+    queryClient.setQueryData(
+      QUERY_KEYS.notebook(notebookId),
+      (old: NotebookResponse | undefined) =>
+        old ? { ...old, context_config: contextConfig } : old
+    )
+    return contextConfig
+  }, [notebookId, queryClient])
+
+  // Debounced wrapper (300 ms) used while the user is actively toggling modes.
+  const persistContextConfig = useCallback((selections: ContextSelections) => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    saveTimerRef.current = setTimeout(() => {
+      doSaveContextConfig(selections)
+    }, 300)
+  }, [doSaveContextConfig])
+
+  // Ref that always holds the latest selections so the unmount effect can read it
+  // without needing it as a dependency (avoids re-registering cleanup on every change).
+  const contextSelectionsRef = useRef(contextSelections)
+  useEffect(() => {
+    contextSelectionsRef.current = contextSelections
+  }, [contextSelections])
+
+  // Flush any pending debounced save on page unload (F5, tab close) AND on
+  // React navigation (component unmount).
+  //
+  // `beforeunload` fires synchronously before the browser unloads the page,
+  // giving us a chance to call fetch(keepalive:true) in the same task — which
+  // the browser guarantees to complete even after navigation.
+  //
+  // The useEffect cleanup handles soft React navigation (no full reload).
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current)
+        saveTimerRef.current = null
+        doSaveContextConfig(contextSelectionsRef.current)
+      }
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload)
+      // Also flush on React navigation (no full reload)
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current)
+        saveTimerRef.current = null
+        doSaveContextConfig(contextSelectionsRef.current)
+      }
+    }
+  // doSaveContextConfig is stable (useCallback with stable deps).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doSaveContextConfig])
+
   // Handler to update context selection
   const handleContextModeChange = (itemId: string, mode: ContextMode, type: 'source' | 'note') => {
-    setContextSelections(prev => ({
-      ...prev,
-      [type === 'source' ? 'sources' : 'notes']: {
-        ...(type === 'source' ? prev.sources : prev.notes),
-        [itemId]: mode
+    setContextSelections(prev => {
+      const next = {
+        ...prev,
+        [type === 'source' ? 'sources' : 'notes']: {
+          ...(type === 'source' ? prev.sources : prev.notes),
+          [itemId]: mode
+        }
       }
-    }))
+      persistContextConfig(next)
+      return next
+    })
   }
 
   if (notebookLoading) {

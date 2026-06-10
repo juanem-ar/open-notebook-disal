@@ -1,0 +1,8 @@
+-- Migration 17: Re-define context_config with OVERWRITE + FLEXIBLE.
+-- Migration 15 defined the field without FLEXIBLE (SurrealDB silently strips
+-- arbitrary nested keys on SCHEMAFULL tables).
+-- Migration 16 used IF NOT EXISTS which is a no-op when the field already
+-- exists, so the type was never corrected on existing databases.
+-- OVERWRITE forces the field definition to be replaced regardless.
+
+DEFINE FIELD OVERWRITE context_config ON TABLE notebook FLEXIBLE TYPE option<object>;

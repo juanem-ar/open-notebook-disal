@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import traceback
 from typing import Any, Dict, List, Optional
 
@@ -7,6 +8,7 @@ from langchain_core.runnables import RunnableConfig
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from open_notebook.config import LANGGRAPH_CHECKPOINT_FILE
 from open_notebook.database.repository import ensure_record_id, repo_query
 from open_notebook.domain.notebook import ChatSession, Note, Notebook, Source
 from open_notebook.exceptions import (
@@ -359,6 +361,60 @@ async def delete_session(session_id: str):
         raise HTTPException(status_code=500, detail=f"Error deleting session: {str(e)}")
 
 
+class ClearAllSessionsResponse(BaseModel):
+    success: bool
+    sessions_deleted: int
+    checkpoints_deleted: int
+    writes_deleted: int
+
+
+@router.delete("/chat/sessions", response_model=ClearAllSessionsResponse)
+async def clear_all_sessions():
+    """
+    Delete ALL chat sessions from SurrealDB and purge their LangGraph
+    checkpoints from SQLite.  Used from the Advanced UI to fully reset
+    conversation history across the system.
+    """
+    try:
+        # 1. Count + delete all sessions from SurrealDB
+        sessions = await repo_query("SELECT id FROM chat_session")
+        sessions_deleted = len(sessions)
+        await repo_query("DELETE chat_session")
+        logger.info(f"Deleted {sessions_deleted} chat_session records from SurrealDB")
+
+        # 2. Purge LangGraph checkpoints from SQLite
+        checkpoints_deleted = 0
+        writes_deleted = 0
+        try:
+            def _purge_all() -> tuple[int, int]:
+                with sqlite3.connect(LANGGRAPH_CHECKPOINT_FILE) as conn:
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM checkpoints")
+                    cp = cur.rowcount
+                    cur.execute("DELETE FROM writes")
+                    wr = cur.rowcount
+                    conn.commit()
+                    return cp, wr
+
+            checkpoints_deleted, writes_deleted = await asyncio.to_thread(_purge_all)
+            logger.info(
+                f"Purged SQLite: {checkpoints_deleted} checkpoints, "
+                f"{writes_deleted} writes"
+            )
+        except Exception as e:
+            logger.warning(f"SQLite purge failed (non-fatal): {e}")
+
+        return ClearAllSessionsResponse(
+            success=True,
+            sessions_deleted=sessions_deleted,
+            checkpoints_deleted=checkpoints_deleted,
+            writes_deleted=writes_deleted,
+        )
+    except Exception as e:
+        logger.error(f"Error clearing all sessions: {e}")
+        raise HTTPException(status_code=500, detail=f"Error clearing sessions: {str(e)}")
+
+
 @router.post("/chat/execute", response_model=ExecuteChatResponse)
 async def execute_chat(request: ExecuteChatRequest):
     """Execute a chat request and get AI response."""
@@ -459,6 +515,16 @@ async def build_context(request: BuildContextRequest):
         if not notebook:
             raise HTTPException(status_code=404, detail="Notebook not found")
 
+        # Load persisted context_config — "not in" entries are authoritative.
+        # Normalise keys to plain strings so RecordID objects (if any) match correctly.
+        saved_cfg = notebook.context_config or {}
+        saved_sources: dict[str, str] = {
+            str(k): str(v) for k, v in saved_cfg.get("sources", {}).items()
+        }
+        saved_notes: dict[str, str] = {
+            str(k): str(v) for k, v in saved_cfg.get("notes", {}).items()
+        }
+
         context_data: dict[str, list[dict[str, str]]] = {"sources": [], "notes": []}
         total_content = ""
 
@@ -466,17 +532,17 @@ async def build_context(request: BuildContextRequest):
         if request.context_config:
             # Process sources
             for source_id, status in request.context_config.get("sources", {}).items():
-                if "not in" in status:
+                full_source_id = (
+                    source_id
+                    if source_id.startswith("source:")
+                    else f"source:{source_id}"
+                )
+                # Saved "not in" overrides whatever the frontend sends
+                saved_status = saved_sources.get(full_source_id, "")
+                if "not in" in saved_status or "not in" in status:
                     continue
 
                 try:
-                    # Add table prefix if not present
-                    full_source_id = (
-                        source_id
-                        if source_id.startswith("source:")
-                        else f"source:{source_id}"
-                    )
-
                     try:
                         source = await Source.get(full_source_id)
                     except Exception:
@@ -496,14 +562,14 @@ async def build_context(request: BuildContextRequest):
 
             # Process notes
             for note_id, status in request.context_config.get("notes", {}).items():
-                if "not in" in status:
+                full_note_id = (
+                    note_id if note_id.startswith("note:") else f"note:{note_id}"
+                )
+                saved_status = saved_notes.get(full_note_id, "")
+                if "not in" in saved_status or "not in" in status:
                     continue
 
                 try:
-                    # Add table prefix if not present
-                    full_note_id = (
-                        note_id if note_id.startswith("note:") else f"note:{note_id}"
-                    )
                     note = await Note.get(full_note_id)
                     if not note:
                         continue
@@ -516,11 +582,16 @@ async def build_context(request: BuildContextRequest):
                     logger.warning(f"Error processing note {note_id}: {str(e)}")
                     continue
         else:
-            # Default behavior - include all sources and notes with short context
+            # No frontend config — use saved config; fall back to all sources/notes
             sources = await notebook.get_sources()
             for source in sources:
                 try:
-                    source_context = await source.get_context(context_size="short")
+                    src_id = str(source.id)
+                    saved_status = saved_sources.get(src_id, "insights")
+                    if "not in" in saved_status:
+                        continue
+                    size = "long" if "full content" in saved_status else "short"
+                    source_context = await source.get_context(context_size=size)
                     context_data["sources"].append(source_context)
                     total_content += str(source_context)
                 except Exception as e:
@@ -530,7 +601,12 @@ async def build_context(request: BuildContextRequest):
             notes = await notebook.get_notes()
             for note in notes:
                 try:
-                    note_context = note.get_context(context_size="short")
+                    note_id = str(note.id)
+                    saved_status = saved_notes.get(note_id, "full content")
+                    if "not in" in saved_status:
+                        continue
+                    size = "long" if "full content" in saved_status else "short"
+                    note_context = note.get_context(context_size=size)
                     context_data["notes"].append(note_context)
                     total_content += str(note_context)
                 except Exception as e:

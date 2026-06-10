@@ -1,0 +1,3 @@
+-- Migration 16 down: Revert context_config back to non-flexible object type.
+
+DEFINE FIELD IF NOT EXISTS context_config ON TABLE notebook TYPE option<object>;

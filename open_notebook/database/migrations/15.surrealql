@@ -1,0 +1,4 @@
+-- Migration 15: Persistent context_config on notebook
+-- Stores per-source/note context inclusion settings so external callers inherit them
+
+DEFINE FIELD IF NOT EXISTS context_config ON TABLE notebook FLEXIBLE TYPE option<object>;

@@ -1,0 +1,4 @@
+-- Migration 18 down
+
+REMOVE FIELD session_ttl_minutes ON TABLE notebook;
+REMOVE FIELD session_version ON TABLE chat_session;
